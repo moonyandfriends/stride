@@ -44,39 +44,23 @@ over-count in `TotalDelegations` (+614k) nearly offsets the liquid the rate igno
 (`UpdateRedemptionRateForHostZone` does not count the delegation ICA's raw balance). Any fix
 must preserve this.
 
-## 3. Per-epoch allocation (derived from current state — no archive required)
+## 3. Why a migration is required (and what it must do)
 
-The three numbers do not reconcile 1:1 (stuck 676.4k ≠ liquid 623.8k ≠ phantom 614.4k) because
-some stuck epochs **executed but lost their ack** (produced liquid) while others **never executed**
-(error-ack, no liquid). This split can be derived **without any archive**, from two facts:
+The stuck epochs already retry every unbonding cycle and keep failing. Retrying alone can't fix
+it, for two reasons:
 
-1. **Executed volume = the phantom = 614,423.1 OSMO.** The phantom is exactly the on-chain
-   drainage that was never decremented from records; those tokens have already completed unbonding
-   and are the stranded liquid. (The only amount still unbonding on-chain is a separate ~522 OSMO
-   in-flight to 2026-07-07 — not part of this.)
-2. **Attribution is oldest-epoch-first.** `UpdateHostZoneUnbondingsAfterUndelegation` decrements
-   records "in a cascading fashion starting from the earliest record", so the correct
-   reconciliation is exactly what that callback *would* have done with the executed amount: apply
-   614,423.1 OSMO to the stuck epochs oldest-first.
+1. **The retry targets the phantom validators.** The undelegation split still points at
+   cosmostation/chorus_one/pryzmstakedrop, which hold ~0 on-chain, so the host rejects it. Until
+   the phantom `Delegation` records are reconciled to on-chain, every retry fails. (The
+   shares-safety fix does not help here — that's the INJ rounding case, not a zero-delegation
+   target.)
+2. **Clearing the phantom cratered the rate unless the liquid is credited.** Removing 614.4k from
+   `TotalDelegations` drops the redemption rate ~13% instantly, because the rate never counted the
+   623.8k liquid — the phantom was the only thing keeping that balance in the rate.
 
-Replaying that (using each record's current `native_tokens_to_unbond`):
-
-| Epoch | to_unbond (OSMO) | cumulative | classification |
-|------:|-----------------:|-----------:|----------------|
-| 1345 | 559,031.6 | 559,031.6 | executed → pay from liquid |
-| 1346 | 49,330.7 | 608,362.3 | executed → pay from liquid |
-| 1354 | 7,066.7 | 615,429.0 | boundary — 6,060.8 from liquid / 1,005.9 unbond |
-| 1355,1358,1361,1362,1371,1374,1381,1384 | 61,936.7 | 676,365.7 | never executed → unbond fresh |
-
-Result: **614,423.1 OSMO** owed to the oldest redemptions is paid from the liquid; **~61,943 OSMO**
-(newest) is unbonded fresh; the **~9,384 OSMO** liquid surplus is reinvestment rewards → re-delegate.
-
-Optional simplification: pay only whole epochs from liquid (1345+1346 = 608,362.3), treat 1354
-onward as unbond-fresh, and roll the 6,060.8 boundary remainder into the re-delegated surplus. This
-avoids splitting an epoch's user-redemption records; slightly more unbonds fresh.
-
-> Re-read `native_tokens_to_unbond` / `st_tokens_to_burn` for each epoch at migration time (values
-> are current-state) and re-derive the phantom per validator, then assert the totals below.
+So the migration's essential job is exactly **two accounting corrections**: reconcile the phantom
+records, and credit the stranded liquid. Everything else (paying redeemers, burning stTokens) is
+then done by the existing, battle-tested unbonding machinery — no per-epoch logic required.
 
 ## 4. Forward fixes (shipped as separate PRs)
 
@@ -86,39 +70,54 @@ avoids splitting an epoch's user-redemption records; slightly more unbonds fresh
    alertable instead of silent (both chains).
 3. **`CheckDelegationRecordsConsistent`** in BeginBlocker — log-only internal accounting check.
 
-## 5. OSMO state migration (v33 upgrade handler) — algorithm
+## 5. Recommended migration (v33): reconcile records, let the queue drain
 
-Inputs (all from §2/§3, current-state — no archive): the per-epoch executed/never-executed split
-from the oldest-first table, and the per-validator phantom.
+Two state edits in the upgrade handler; the existing machinery does the rest.
 
-Per stuck epoch:
-- **Executed epochs** (tokens already in the liquid):
-  1. Decrement the phantom validator `Delegation` and `TotalDelegations` by the executed amount.
-  2. Advance the host-zone unbonding record to `EXIT_TRANSFER_QUEUE` (set `UnbondingTime` in the
-     past) so the existing sweep pays redeemers from the liquid.
-  3. Burn the corresponding stTokens.
-  - Rate is preserved: numerator −amount and denominator −amount/rate are proportional at the
-    current rate (amount = stTokens × rate), so `(N−amount)/(D−amount/rate) == N/D`.
-- **Never-executed epochs** (tokens still in real delegations):
-  1. Reconcile the phantom validators' `Delegation` down to on-chain (so the retry's split
-     targets real validators), decrementing `TotalDelegations` by the same.
-  2. Leave the record in the queue; with the shares-safety fix (PR 1) the next unbonding
-     succeeds against real delegations. No stToken burn yet.
+1. **Reconcile the phantom.** For each of the 3 validators, set `Delegation` to its on-chain value
+   (cosmostation → 0, chorus_one → 0, pryzmstakedrop → 60,662.8) and decrement `TotalDelegations`
+   by the total (614,423.1). Re-derive these from live state at migration time.
+2. **Credit the stranded liquid.** Create a `DELEGATION_QUEUE` deposit record for the delegation
+   ICA's liquid balance (~623,806.6), so it is counted (`undelegatedBalance`) and re-delegated by
+   the normal delegate flow.
 
-Residual liquid surplus (~9.4k reinvestment rewards): create a `DELEGATION_QUEUE` deposit record
-so it's counted (`undelegatedBalance`) and re-delegated by the normal flow.
+Net backing change ≈ **+9.4k** (previously-uncounted reinvestment rewards) → the redemption rate
+is preserved (a hair higher). Correct, not coincidental.
+
+After that, no custom per-epoch code: the stuck epochs retry, now find the phantom validators at
+0 capacity so the split targets real validators, succeed (with the shares-safety fix), unbond
+fresh, and the normal `UndelegateCallback` burns stTokens and pays redeemers. No manual burn,
+no manual sweep, no per-epoch allocation.
+
+Trade-off vs. Appendix A: the already-unbonded redeemers (epochs 1345/1346) wait one more
+unbonding period, and ~614k is re-delegated then re-undelegated (churn). Accepted in exchange for
+using only well-tested flows instead of novel fund-moving migration code — the right call for
+live funds.
+
+### Must confirm on the fork replay (the riskiest assumption)
+- **A manually-created `DELEGATION_QUEUE` deposit record actually gets delegated against the
+  pre-existing liquid** in the delegation account. The normal path assumes tokens arrived via
+  deposit → IBC transfer → delegate; a record created directly against balance already sitting in
+  the delegation ICA may not be picked up. If it isn't, the migration must instead issue the
+  delegate ICA directly (or trigger the transfer/sweep step). **Prove this on the fork before
+  anything else.**
+- Once the phantom is cleared, the stuck epochs produce a valid undelegation split (real
+  validators) and complete end-to-end (unbond → sweep → claim).
 
 ### Post-migration assertions (must all hold)
 - For every OSMO validator: `Delegation == TokensFromShares(on-chain shares)`.
 - `TotalDelegations == Σ validator.Delegation`.
-- Redemption rate change is within inner safety bounds (should be ~0).
-- Sum of amounts swept to the redemption account == sum owed to the paid redeemers.
+- Redemption-rate change within inner safety bounds (≈ 0).
+- Delegation ICA liquid balance re-delegated (→ ~0 after the delegate lands).
+- Every stuck redemption eventually reaches `CLAIMABLE` and pays its user the recorded amount.
 
 ## 6. Do NOT
-- Do **not** run `calibrate`/slash on the OSMO phantom without the paired liquid handling — it
-  drops `TotalDelegations` ~614k with no offset, tanking the rate ~13% and likely tripping the
+- Do **not** run `calibrate`/slash on the phantom without also crediting the liquid — it drops
+  `TotalDelegations` ~614k with no offset, tanking the rate ~13% and likely tripping the
   safety-bound halt. (`CalibrateDelegation` is blocked anyway by `CalibrationThreshold = 5000`.)
-- Do **not** re-delegate the phantom-corresponding liquid to stakers — it is owed to redeemers.
+- Do **not** clear the phantom without confirming the stuck records will still unbond (they do,
+  once the split targets real validators) — otherwise redeemers are neither paid from liquid nor
+  re-unbonded.
 
 ## 7. Prevention (process)
 - Ramp validator weights toward 0 over several unbonding periods, not in one upgrade.
@@ -126,3 +125,26 @@ so it's counted (`undelegatedBalance`) and re-delegated by the normal flow.
   `ValidateUnbondAmount` before shipping.
 - Monitor: delegation ICA holding non-trivial liquid; tracked-vs-on-chain delegation divergence
   (needs periodic ICQ); the new `undelegation_failed` event.
+
+## Appendix A — alternative: pay executed redeemers directly from the liquid
+
+Faster for the oldest redeemers (no extra unbonding wait) but requires more custom fund-moving
+migration code, so it is **not** recommended unless sparing those redeemers ~14 days outweighs the
+added risk.
+
+It relies on a per-epoch split that is derivable **without an archive**: the executed volume
+equals the phantom (614,423.1 OSMO — already completed unbonding, now the liquid), attributed
+oldest-epoch-first because `UpdateHostZoneUnbondingsAfterUndelegation` decrements records "starting
+from the earliest record". Replaying that against each record's current `native_tokens_to_unbond`:
+
+| Epoch | to_unbond (OSMO) | cumulative | classification |
+|------:|-----------------:|-----------:|----------------|
+| 1345 | 559,031.6 | 559,031.6 | executed → pay from liquid |
+| 1346 | 49,330.7 | 608,362.3 | executed → pay from liquid |
+| 1354 | 7,066.7 | 615,429.0 | boundary — 6,060.8 from liquid / 1,005.9 unbond |
+| 1355,1358,1361,1362,1371,1374,1381,1384 | 61,936.7 | 676,365.7 | never executed → unbond fresh |
+
+For the executed epochs: decrement the phantom `Delegation` + `TotalDelegations`, advance the
+record to `EXIT_TRANSFER_QUEUE` (so the sweep pays from liquid), and burn the stTokens. Rate is
+preserved because `amount = stTokens × rate`, so numerator −amount and denominator −amount/rate
+keep `N/D` constant. Never-executed epochs and the liquid surplus are handled as in §5.
