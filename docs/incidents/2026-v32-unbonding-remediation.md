@@ -44,25 +44,39 @@ over-count in `TotalDelegations` (+614k) nearly offsets the liquid the rate igno
 (`UpdateRedemptionRateForHostZone` does not count the delegation ICA's raw balance). Any fix
 must preserve this.
 
-## 3. Forensic gap (why the migration can't be built from public data)
+## 3. Per-epoch allocation (derived from current state — no archive required)
 
-The three numbers do **not** reconcile 1:1 (stuck 682.4k ≠ liquid 623.8k ≠ phantom 614.4k),
-because some stuck epochs **never executed** (error-ack, no liquid) while others **executed but
-lost their ack** (produced liquid). Allocating the liquid to the right redeemers is per-epoch.
+The three numbers do not reconcile 1:1 (stuck 676.4k ≠ liquid 623.8k ≠ phantom 614.4k) because
+some stuck epochs **executed but lost their ack** (produced liquid) while others **never executed**
+(error-ack, no liquid). This split can be derived **without any archive**, from two facts:
 
-Public infra cannot resolve this: the public Stride archive's tx index only retains ~9 days
-(`timeout_packet` on the OSMO delegation port = 0 in-window; oldest ack 2026-06-22), so the May
-undelegations that produced the liquid are gone. **The core team must derive the per-epoch split
-from an internal full archive + the icacallbacks callback data (packet → epoch mapping).**
+1. **Executed volume = the phantom = 614,423.1 OSMO.** The phantom is exactly the on-chain
+   drainage that was never decremented from records; those tokens have already completed unbonding
+   and are the stranded liquid. (The only amount still unbonding on-chain is a separate ~522 OSMO
+   in-flight to 2026-07-07 — not part of this.)
+2. **Attribution is oldest-epoch-first.** `UpdateHostZoneUnbondingsAfterUndelegation` decrements
+   records "in a cascading fashion starting from the earliest record", so the correct
+   reconciliation is exactly what that callback *would* have done with the executed amount: apply
+   614,423.1 OSMO to the stuck epochs oldest-first.
 
-### Required internal queries
-For each stuck OSMO epoch record, determine the historical outcome of its undelegation ICA:
-- **timeout ack** (or success ack whose callback errored) → executed on host → tokens are in the
-  stranded liquid → this redemption is *already unbonded*.
-- **error ack only, never a timeout/success** → never executed → still needs to unbond.
+Replaying that (using each record's current `native_tokens_to_unbond`):
 
-Cross-check against Osmosis archive `complete_unbonding` events crediting the delegation ICA
-(amounts + completion times) to confirm the liquid attribution.
+| Epoch | to_unbond (OSMO) | cumulative | classification |
+|------:|-----------------:|-----------:|----------------|
+| 1345 | 559,031.6 | 559,031.6 | executed → pay from liquid |
+| 1346 | 49,330.7 | 608,362.3 | executed → pay from liquid |
+| 1354 | 7,066.7 | 615,429.0 | boundary — 6,060.8 from liquid / 1,005.9 unbond |
+| 1355,1358,1361,1362,1371,1374,1381,1384 | 61,936.7 | 676,365.7 | never executed → unbond fresh |
+
+Result: **614,423.1 OSMO** owed to the oldest redemptions is paid from the liquid; **~61,943 OSMO**
+(newest) is unbonded fresh; the **~9,384 OSMO** liquid surplus is reinvestment rewards → re-delegate.
+
+Optional simplification: pay only whole epochs from liquid (1345+1346 = 608,362.3), treat 1354
+onward as unbond-fresh, and roll the 6,060.8 boundary remainder into the re-delegated surplus. This
+avoids splitting an epoch's user-redemption records; slightly more unbonds fresh.
+
+> Re-read `native_tokens_to_unbond` / `st_tokens_to_burn` for each epoch at migration time (values
+> are current-state) and re-derive the phantom per validator, then assert the totals below.
 
 ## 4. Forward fixes (shipped as separate PRs)
 
@@ -74,8 +88,8 @@ Cross-check against Osmosis archive `complete_unbonding` events crediting the de
 
 ## 5. OSMO state migration (v33 upgrade handler) — algorithm
 
-Inputs (from §3 internal forensics): per stuck epoch, `executed` bool and the executed amount;
-plus the per-validator phantom from §2.
+Inputs (all from §2/§3, current-state — no archive): the per-epoch executed/never-executed split
+from the oldest-first table, and the per-validator phantom.
 
 Per stuck epoch:
 - **Executed epochs** (tokens already in the liquid):
